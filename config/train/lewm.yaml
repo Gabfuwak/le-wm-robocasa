@@ -46,7 +46,8 @@ wm:
   type: lewm
   history_size: 3
   num_preds: 1
-  embed_dim: 192
+  visual_embed_dim: 192
+  proprio_proj_dim: 64
 
 predictor:
   depth: 6

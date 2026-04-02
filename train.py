@@ -88,7 +88,9 @@ def run(cfg):
     )
 
     hidden_dim = encoder.config.hidden_size
-    embed_dim = cfg.wm.get("embed_dim", hidden_dim)
+    visual_embed_dim = cfg.wm.get("visual_embed_dim", cfg.wm.get("embed_dim", hidden_dim))
+    proprio_proj_dim = cfg.wm.get("proprio_proj_dim", 0)
+    embed_dim = visual_embed_dim + proprio_proj_dim
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
 
     predictor = ARPredictor(
@@ -100,10 +102,10 @@ def run(cfg):
     )
 
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
-    
+
     projector = MLP(
         input_dim=hidden_dim,
-        output_dim=embed_dim,
+        output_dim=visual_embed_dim,
         hidden_dim=2048,
         norm_fn=torch.nn.BatchNorm1d,
     )
@@ -115,12 +117,17 @@ def run(cfg):
         norm_fn=torch.nn.BatchNorm1d,
     )
 
+    proprio_encoder = None
+    if proprio_proj_dim > 0 and hasattr(cfg.wm, "proprio_dim"):
+        proprio_encoder = torch.nn.Linear(cfg.wm.proprio_dim, proprio_proj_dim)
+
     world_model = JEPA(
         encoder=encoder,
         predictor=predictor,
         action_encoder=action_encoder,
         projector=projector,
         pred_proj=predictor_proj,
+        proprio_encoder=proprio_encoder,
     )
 
     optimizers = {

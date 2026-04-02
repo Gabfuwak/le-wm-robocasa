@@ -17,6 +17,7 @@ class JEPA(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        proprio_encoder=None,
     ):
         super().__init__()
 
@@ -25,6 +26,7 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.proprio_encoder = proprio_encoder
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -37,6 +39,12 @@ class JEPA(nn.Module):
         output = self.encoder(pixels, interpolate_pos_encoding=True)
         pixels_emb = output.last_hidden_state[:, 0]  # cls token
         emb = self.projector(pixels_emb)
+
+        if self.proprio_encoder is not None and "proprio" in info:
+            proprio = rearrange(info["proprio"].float(), "b t d -> (b t) d")
+            proprio_emb = self.proprio_encoder(proprio)
+            emb = torch.cat([emb, proprio_emb], dim=-1)
+
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
 
         if "action" in info:
