@@ -72,9 +72,16 @@ def main(args):
     assert camera_key in info["features"], \
         f"Camera '{camera_key}' not in {list(info['features'])}"
 
+    camera_eih_key = None
+    if args.camera_eih:
+        camera_eih_key = f"observation.images.{args.camera_eih}"
+        assert camera_eih_key in info["features"], \
+            f"Camera EIH '{camera_eih_key}' not in {list(info['features'])}"
+
     output_path = Path(args.output).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Episodes: {len(episodes)},  Frames: {total_frames},  Output: {output_path}")
+    cameras_str = args.camera + (f" + {args.camera_eih}" if args.camera_eih else "")
+    print(f"Episodes: {len(episodes)},  Frames: {total_frames},  Cameras: {cameras_str},  Output: {output_path}")
 
     with h5py.File(output_path, "w") as f:
         f.create_dataset("ep_len", data=ep_lengths)
@@ -83,6 +90,12 @@ def main(args):
             "pixels", shape=(total_frames, args.img_size, args.img_size, 3),
             dtype=np.uint8, chunks=(32, args.img_size, args.img_size, 3),
         )
+        pixels_eih_ds = None
+        if camera_eih_key:
+            pixels_eih_ds = f.create_dataset(
+                "pixels_eih", shape=(total_frames, args.img_size, args.img_size, 3),
+                dtype=np.uint8, chunks=(32, args.img_size, args.img_size, 3),
+            )
         action_ds  = f.create_dataset("action",  shape=(total_frames, 7), dtype=np.float32)
         proprio_ds = f.create_dataset("proprio", shape=(total_frames, 9), dtype=np.float32)
 
@@ -96,6 +109,13 @@ def main(args):
             assert len(frames) == ep_lengths[ep_idx], \
                 f"Episode {ep_idx}: expected {ep_lengths[ep_idx]} frames, got {len(frames)}"
             pixels_ds[start:end] = frames
+
+            if pixels_eih_ds is not None:
+                vpath_eih = dataset_path / "videos" / f"chunk-{chunk:03d}" / camera_eih_key / f"episode_{ep_idx:06d}.mp4"
+                frames_eih = read_video_frames(vpath_eih, args.img_size)
+                assert len(frames_eih) == ep_lengths[ep_idx], \
+                    f"Episode {ep_idx} EIH: expected {ep_lengths[ep_idx]} frames, got {len(frames_eih)}"
+                pixels_eih_ds[start:end] = frames_eih
 
             ppath = dataset_path / "data" / f"chunk-{chunk:03d}" / f"episode_{ep_idx:06d}.parquet"
             df = pd.read_parquet(ppath, columns=["action", "observation.state"])
@@ -111,5 +131,9 @@ if __name__ == "__main__":
     parser.add_argument("--output",       default="~/data/robocasa/robocasa_pickplace_train.h5")
     parser.add_argument("--img-size",     type=int, default=96)
     parser.add_argument("--camera",       default="robot0_agentview_left")
+    parser.add_argument("--camera-eih",   default="robot0_eye_in_hand", dest="camera_eih",
+                        help="Eye-in-hand camera name; writes pixels_eih dataset. Set to '' to disable.")
     args = parser.parse_args()
+    if args.camera_eih == "":
+        args.camera_eih = None
     main(args)

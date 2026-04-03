@@ -18,6 +18,7 @@ class JEPA(nn.Module):
         projector=None,
         pred_proj=None,
         proprio_encoder=None,
+        encoder_eih=None,
     ):
         super().__init__()
 
@@ -27,6 +28,7 @@ class JEPA(nn.Module):
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
         self.proprio_encoder = proprio_encoder
+        self.encoder_eih = encoder_eih
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -36,9 +38,14 @@ class JEPA(nn.Module):
         pixels = info['pixels'].float()
         b = pixels.size(0)
         pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
-        output = self.encoder(pixels, interpolate_pos_encoding=True)
-        pixels_emb = output.last_hidden_state[:, 0]  # cls token
-        emb = self.projector(pixels_emb)
+        cls = self.encoder(pixels, interpolate_pos_encoding=True).last_hidden_state[:, 0]
+
+        if self.encoder_eih is not None and "pixels_eih" in info:
+            pixels_eih = rearrange(info['pixels_eih'].float(), "b t ... -> (b t) ...")
+            cls_eih = self.encoder_eih(pixels_eih, interpolate_pos_encoding=True).last_hidden_state[:, 0]
+            cls = torch.cat([cls, cls_eih], dim=-1)  # (B*T, 2*hidden_dim)
+
+        emb = self.projector(cls)
 
         if self.proprio_encoder is not None and "proprio" in info:
             proprio = rearrange(info["proprio"].float(), "b t d -> (b t) d")

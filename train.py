@@ -52,8 +52,10 @@ def run(cfg):
     #########################
 
     dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
-    
+    pixel_keys = [k for k in cfg.data.dataset.keys_to_load if k.startswith("pixels")]
+    transforms = [get_img_preprocessor(source=k, target=k, img_size=cfg.img_size) for k in pixel_keys]
+    num_cameras = len(pixel_keys)
+
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
@@ -104,7 +106,7 @@ def run(cfg):
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
 
     projector = MLP(
-        input_dim=hidden_dim,
+        input_dim=num_cameras * hidden_dim,
         output_dim=visual_embed_dim,
         hidden_dim=2048,
         norm_fn=torch.nn.BatchNorm1d,
@@ -121,6 +123,8 @@ def run(cfg):
     if proprio_proj_dim > 0 and hasattr(cfg.wm, "proprio_dim"):
         proprio_encoder = torch.nn.Linear(cfg.wm.proprio_dim, proprio_proj_dim)
 
+    encoder_eih = encoder if num_cameras > 1 else None
+
     world_model = JEPA(
         encoder=encoder,
         predictor=predictor,
@@ -128,6 +132,7 @@ def run(cfg):
         projector=projector,
         pred_proj=predictor_proj,
         proprio_encoder=proprio_encoder,
+        encoder_eih=encoder_eih,
     )
 
     optimizers = {

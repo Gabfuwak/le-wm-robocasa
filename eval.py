@@ -106,6 +106,12 @@ class RoboCasaWorld(swm.World):
         if eef_pos is not None and eef_rot is not None and gripper is not None:
             self.infos["proprio"] = np.concatenate([eef_pos, eef_rot, gripper], axis=-1)
 
+    def _rebuild_pixels_eih(self) -> None:
+        """Expose eye-in-hand camera obs as `pixels_eih` for dual-camera encoding."""
+        eih = self.infos.get("video.robot0_eye_in_hand")
+        if eih is not None:
+            self.infos["pixels_eih"] = eih
+
     def step(self) -> None:
         """Step envs, then restore proprio (and goal) which env doesn't output."""
         for k in list(self.infos.keys()):
@@ -114,6 +120,7 @@ class RoboCasaWorld(swm.World):
 
         super().step()
         self._rebuild_proprio()
+        self._rebuild_pixels_eih()
         self.infos.update(self._sticky_infos)
 
 
@@ -174,10 +181,19 @@ def run_fresh_eval(world, dataset, cfg, eval_episodes, eval_start_idx, results_p
             goal_proprio[None, None], (1, history_size, *goal_proprio.shape)
         ).copy()
 
+        sticky = {"goal": goal_pixels_hist, "goal_proprio": goal_proprio_hist}
+
+        if "pixels_eih" in goal_row_data[0]:
+            goal_pixels_eih = goal_row_data[0]["pixels_eih"][-1].permute(1, 2, 0).numpy()
+            sticky["goal_pixels_eih"] = np.broadcast_to(
+                goal_pixels_eih[None, None], (1, history_size, *goal_pixels_eih.shape)
+            ).copy()
+
         # --- fresh env reset ---
         world.reset()
         world._rebuild_proprio()
-        world._sticky_infos = {"goal": goal_pixels_hist, "goal_proprio": goal_proprio_hist}
+        world._rebuild_pixels_eih()
+        world._sticky_infos = sticky
         world.infos.update(world._sticky_infos)
 
         ep_frames = []
@@ -227,7 +243,9 @@ def run(cfg: DictConfig):
     # create the transform
     transform = {
         "pixels": img_transform(cfg),
+        "pixels_eih": img_transform(cfg),
         "goal": img_transform(cfg),
+        "goal_pixels_eih": img_transform(cfg),
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)

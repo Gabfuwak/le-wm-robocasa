@@ -4,6 +4,7 @@ dataset:
   name: robocasa_pickplace_train
   keys_to_load:
     - pixels
+    - pixels_eih
     - action
     - proprio
   keys_to_cache:
