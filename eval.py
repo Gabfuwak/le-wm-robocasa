@@ -2,17 +2,120 @@ import os
 
 os.environ["MUJOCO_GL"] = "egl"
 
+try:
+    import robocasa  # registers robocasa gym envs
+except ImportError:
+    pass
+
 import time
 from pathlib import Path
 
+import imageio
+import gymnasium as gym
 import hydra
 import numpy as np
 import stable_pretraining as spt
 import torch
+from functools import partial
+from gymnasium import spaces
 from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
+from stable_worldmodel.world import MegaWrapper, SyncWorld, VariationWrapper, _make_env
+
+
+def _episode_col(dataset):
+    return "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+
+
+class FlatActionWrapper(gym.ActionWrapper):
+    """Flattens RoboCasa's Dict action space into a flat Box for CEM planning.
+
+    Maps flat 7-dim actions [eef_pos(3), eef_rot(3), gripper(1)] to the
+    RoboCasa Dict action space. Base motion and control mode are zeroed out.
+    Must be applied BEFORE MegaWrapper so EverythingToInfoWrapper sees flat actions.
+    """
+
+    def __init__(self, env: gym.Env) -> None:
+        super().__init__(env)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
+
+    def action(self, action: np.ndarray) -> dict:
+        return {
+            "action.end_effector_position": action[0:3],
+            "action.end_effector_rotation": action[3:6],
+            "action.gripper_close": action[6:7],
+            "action.base_motion": np.zeros(4, dtype=np.float32),
+            "action.control_mode": np.zeros(1, dtype=np.float32),
+        }
+
+
+class RoboCasaWorld(swm.World):
+    """World subclass that applies FlatActionWrapper before MegaWrapper.
+
+    stable_worldmodel's EverythingToInfoWrapper (inside MegaWrapper) raises
+    NotImplementedError if info['action'] is a dict. FlatActionWrapper must
+    be innermost so MegaWrapper sees a flat ndarray action.
+    """
+
+    def __init__(
+        self,
+        env_name,
+        num_envs,
+        image_shape,
+        goal_transform=None,
+        image_transform=None,
+        seed=2349867,
+        history_size=1,
+        frame_skip=1,
+        max_episode_steps=100,
+        **kwargs,
+    ):
+        wrappers = [
+            FlatActionWrapper,
+            partial(
+                MegaWrapper,
+                image_shape=image_shape,
+                pixels_transform=image_transform,
+                goal_transform=goal_transform,
+                history_size=history_size,
+                frame_skip=frame_skip,
+                separate_goal=True,
+            ),
+        ]
+        env_fn = partial(_make_env, env_name, max_episode_steps, wrappers, **kwargs)
+        self.envs = VariationWrapper(SyncWorld([env_fn] * num_envs))
+        self.envs.unwrapped.autoreset_mode = gym.vector.AutoresetMode.DISABLED
+
+        self._history_size = history_size
+        self.policy = None
+        self.states = None
+        self.infos = {}
+        self.rewards = None
+        self.terminateds = None
+        self.truncateds = None
+        self.seed = seed
+        self._sticky_infos: dict = {}  # keys to preserve across env steps
+
+    def _rebuild_proprio(self) -> None:
+        """Reconstruct `proprio` in self.infos from individual env state keys."""
+        eef_pos = self.infos.get("state.end_effector_position_relative")
+        eef_rot = self.infos.get("state.end_effector_rotation_relative")
+        gripper = self.infos.get("state.gripper_qpos")
+        if eef_pos is not None and eef_rot is not None and gripper is not None:
+            self.infos["proprio"] = np.concatenate([eef_pos, eef_rot, gripper], axis=-1)
+
+    def step(self) -> None:
+        """Step envs, then restore proprio (and goal) which env doesn't output."""
+        for k in list(self.infos.keys()):
+            if k.startswith("goal"):
+                self._sticky_infos[k] = self.infos[k]
+
+        super().step()
+        self._rebuild_proprio()
+        self.infos.update(self._sticky_infos)
+
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -27,8 +130,7 @@ def img_transform(cfg):
 
 
 def get_episodes_length(dataset, episodes):
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-
+    col_name = _episode_col(dataset)
     episode_idx = dataset.get_col_data(col_name)
     step_idx = dataset.get_col_data("step_idx")
     lengths = []
@@ -46,6 +148,70 @@ def get_dataset(cfg, dataset_name):
     )
     return dataset
 
+
+def run_fresh_eval(world, dataset, cfg, eval_episodes, eval_start_idx, results_path):
+    """Fresh-reset eval: env resets to its own random state, only the goal comes from the dataset."""
+    eval_budget = cfg.eval.eval_budget
+    goal_offset = cfg.eval.goal_offset_steps
+    history_size = cfg.world.history_size
+
+    successes = np.zeros(cfg.eval.num_eval, dtype=bool)
+    results_path.mkdir(parents=True, exist_ok=True)
+
+    for i, (ep_id, start_step) in enumerate(zip(eval_episodes.tolist(), eval_start_idx.tolist())):
+        # --- sample goal frame from dataset ---
+        goal_row_data = dataset.load_chunk(
+            np.array([ep_id]), np.array([start_step + goal_offset]), np.array([start_step + goal_offset + 1])
+        )
+        goal_pixels = goal_row_data[0]["pixels"][-1].permute(1, 2, 0).numpy()  # (H, W, C) uint8
+        goal_proprio = goal_row_data[0]["proprio"][-1].numpy()  # (9,)
+
+        # broadcast goal to history shape: (1, history, H, W, C)
+        goal_pixels_hist = np.broadcast_to(
+            goal_pixels[None, None], (1, history_size, *goal_pixels.shape)
+        ).copy()
+        goal_proprio_hist = np.broadcast_to(
+            goal_proprio[None, None], (1, history_size, *goal_proprio.shape)
+        ).copy()
+
+        # --- fresh env reset ---
+        world.reset()
+        world._rebuild_proprio()
+        world._sticky_infos = {"goal": goal_pixels_hist, "goal_proprio": goal_proprio_hist}
+        world.infos.update(world._sticky_infos)
+
+        ep_frames = []
+        ep_success = False
+
+        for _ in range(eval_budget):
+            # record frame — convert to channel-last uint8
+            frame = world.infos["pixels"][0, -1]
+            if isinstance(frame, torch.Tensor):
+                frame = frame.numpy()
+            if frame.dtype != np.uint8:
+                frame = (frame * 255).clip(0, 255).astype(np.uint8)
+            if frame.ndim == 3 and frame.shape[0] in (1, 3):
+                frame = frame.transpose(1, 2, 0)
+            ep_frames.append(frame)
+
+            world.step()
+
+            if world.terminateds is not None and world.terminateds[0]:
+                ep_success = True
+                break
+
+        successes[i] = ep_success
+
+        video_path = results_path / f"eval_ep{ep_id}_step{start_step}.mp4"
+        imageio.mimwrite(str(video_path), ep_frames, fps=10)
+        print(f"Eval {i}: ep={ep_id} start={start_step} success={ep_success} frames={len(ep_frames)} video={video_path}")
+
+    return {
+        "success_rate": float(successes.mean()),
+        "episode_successes": successes,
+    }
+
+
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     """Run evaluation of dinowm vs random policy."""
@@ -55,7 +221,8 @@ def run(cfg: DictConfig):
 
     # create world environment
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    img_size = cfg.eval.img_size
+    world = RoboCasaWorld(**cfg.world, image_shape=(img_size, img_size))
 
     # create the transform
     transform = {
@@ -64,16 +231,15 @@ def run(cfg: DictConfig):
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
+    col_name = _episode_col(dataset)
+    ep_indices, _ = np.unique(dataset.get_col_data(col_name), return_index=True)
 
     process = {}
     for col in cfg.dataset.keys_to_cache:
         if col in ["pixels"]:
             continue
         processor = preprocessing.StandardScaler()
-        col_data = stats_dataset.get_col_data(col)
+        col_data = dataset.get_col_data(col)
         col_data = col_data[~np.isnan(col_data).any(axis=1)]
         processor.fit(col_data)
         process[col] = processor
@@ -109,8 +275,6 @@ def run(cfg: DictConfig):
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
-    # Map each dataset row’s episode_idx to its max_start_idx
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
@@ -121,17 +285,15 @@ def run(cfg: DictConfig):
     print(valid_mask.sum(), "valid starting points found for evaluation.")
 
     g = np.random.default_rng(cfg.seed)
-    random_episode_indices = g.choice(
-        len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+    random_episode_indices = np.sort(
+        valid_indices[g.choice(len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False)]
     )
-
-    # sort increasingly to avoid issues with HDF5Dataset indexing
-    random_episode_indices = np.sort(valid_indices[random_episode_indices])
 
     print(random_episode_indices)
 
-    eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
-    eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
+    row_data = dataset.get_row_data(random_episode_indices)
+    eval_episodes = row_data[col_name]
+    eval_start_idx = row_data["step_idx"]
 
     if len(eval_episodes) < cfg.eval.num_eval:
         raise ValueError("Not enough episodes with sufficient length for evaluation.")
@@ -139,17 +301,9 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
 
     start_time = time.time()
-    metrics = world.evaluate_from_dataset(
-        dataset,
-        start_steps=eval_start_idx.tolist(),
-        goal_offset_steps=cfg.eval.goal_offset_steps,
-        eval_budget=cfg.eval.eval_budget,
-        episodes_idx=eval_episodes.tolist(),
-        callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video_path=results_path,
-    )
+    metrics = run_fresh_eval(world, dataset, cfg, eval_episodes, eval_start_idx, results_path)
     end_time = time.time()
-    
+
     print(metrics)
 
     results_path = results_path / cfg.output.filename

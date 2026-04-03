@@ -1,0 +1,36 @@
+defaults:
+  - launcher: local
+  - solver: cem
+  - _self_
+
+world:
+  env_name: robocasa/PickPlaceCounterToCabinet
+  num_envs: ${eval.num_eval}
+  max_episode_steps: 100
+  history_size: 3
+  frame_skip: 5
+  split: null
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    - proprio
+
+seed: 42
+policy: random  # set to checkpoint name relative to STABLEWM_HOME, e.g. lewm_epoch_24
+
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 5
+
+eval:
+  num_eval: 1
+  goal_offset_steps: 30
+  eval_budget: 500
+  img_size: 224
+  dataset_name: robocasa_pickplace_train_224
+
+output:
+  filename: robocasa_pickplace_results.txt
