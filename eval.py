@@ -201,13 +201,22 @@ def run_fresh_eval(world, dataset, cfg, eval_episodes, eval_start_idx, results_p
 
         for _ in range(eval_budget):
             # record frame — convert to channel-last uint8
-            frame = world.infos["pixels"][0, -1]
-            if isinstance(frame, torch.Tensor):
-                frame = frame.numpy()
-            if frame.dtype != np.uint8:
-                frame = (frame * 255).clip(0, 255).astype(np.uint8)
-            if frame.ndim == 3 and frame.shape[0] in (1, 3):
-                frame = frame.transpose(1, 2, 0)
+            def to_uint8_hwc(f):
+                if isinstance(f, torch.Tensor):
+                    f = f.numpy()
+                if f.dtype != np.uint8:
+                    f = (f * 255).clip(0, 255).astype(np.uint8)
+                if f.ndim == 3 and f.shape[0] in (1, 3):
+                    f = f.transpose(1, 2, 0)
+                return f
+
+            frame = to_uint8_hwc(world.infos["pixels"][0, -1])
+            if "pixels_eih" in world.infos:
+                import cv2
+                eih = to_uint8_hwc(world.infos["pixels_eih"][0, -1])
+                h = frame.shape[0]
+                eih = cv2.resize(eih, (h, h))
+                frame = np.concatenate([frame, eih], axis=1)
             ep_frames.append(frame)
 
             world.step()

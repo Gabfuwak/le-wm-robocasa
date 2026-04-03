@@ -38,12 +38,16 @@ class JEPA(nn.Module):
         pixels = info['pixels'].float()
         b = pixels.size(0)
         pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
-        cls = self.encoder(pixels, interpolate_pos_encoding=True).last_hidden_state[:, 0]
 
         if self.encoder_eih is not None and "pixels_eih" in info:
             pixels_eih = rearrange(info['pixels_eih'].float(), "b t ... -> (b t) ...")
-            cls_eih = self.encoder_eih(pixels_eih, interpolate_pos_encoding=True).last_hidden_state[:, 0]
+            # batch both cameras into a single forward pass
+            all_pixels = torch.cat([pixels, pixels_eih], dim=0)
+            all_cls = self.encoder(all_pixels, interpolate_pos_encoding=True).last_hidden_state[:, 0]
+            cls, cls_eih = all_cls.chunk(2, dim=0)
             cls = torch.cat([cls, cls_eih], dim=-1)  # (B*T, 2*hidden_dim)
+        else:
+            cls = self.encoder(pixels, interpolate_pos_encoding=True).last_hidden_state[:, 0]
 
         emb = self.projector(cls)
 
